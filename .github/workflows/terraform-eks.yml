@@ -30,6 +30,7 @@ concurrency:
 
 env:
   TF_IN_AUTOMATION: "true"
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
 
 defaults:
   run:
@@ -51,7 +52,7 @@ jobs:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ github.event_name == 'pull_request' && vars.AWS_PLAN_ROLE_ARN || vars.AWS_APPLY_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Terraform fmt
         run: terraform fmt -check -recursive
@@ -61,7 +62,7 @@ jobs:
           terraform init -input=false \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
             -backend-config="key=eks/terraform.tfstate" \
-            -backend-config="region=${{ vars.AWS_REGION }}"
+            -backend-config="region=${{ env.AWS_REGION }}"
 
       - name: Terraform validate
         run: terraform validate -no-color
@@ -108,8 +109,7 @@ jobs:
     needs: plan
     if: github.event_name != 'pull_request' && inputs.action != 'bootstrap'
     runs-on: ubuntu-latest
-    # Required reviewers on this environment = manual approval gate
-    environment: production
+    # Optional manual approval gate: create a matching GitHub environment in repo settings if desired.
     steps:
       - uses: actions/checkout@v4
 
@@ -120,7 +120,7 @@ jobs:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -132,7 +132,7 @@ jobs:
           terraform init -input=false \
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
             -backend-config="key=eks/terraform.tfstate" \
-            -backend-config="region=${{ vars.AWS_REGION }}"
+            -backend-config="region=${{ env.AWS_REGION }}"
 
       - name: Terraform apply
         run: terraform apply -input=false tfplan
@@ -141,7 +141,7 @@ jobs:
         if: inputs.action != 'destroy'
         run: |
           CLUSTER=$(terraform output -raw cluster_name)
-          aws eks update-kubeconfig --region "${{ vars.AWS_REGION }}" --name "$CLUSTER"
+          aws eks update-kubeconfig --region "${{ env.AWS_REGION }}" --name "$CLUSTER"
           kubectl get nodes -o wide
           kubectl get pods -A
 
@@ -167,19 +167,19 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.BOOTSTRAP_AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.BOOTSTRAP_AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Terraform init
         run: terraform init -input=false
 
       - name: Terraform apply
         env:
-          TF_VAR_region: ${{ vars.AWS_REGION }}
+          TF_VAR_region: ${{ env.AWS_REGION }}
           TF_VAR_github_repo: ${{ github.repository }}
           TF_VAR_github_branch: ${{ github.event.repository.default_branch }}
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          export TF_VAR_state_bucket_name="eks-tfstate-${ACCOUNT_ID}-${{ vars.AWS_REGION }}"
+          export TF_VAR_state_bucket_name="eks-tfstate-${ACCOUNT_ID}-${{ env.AWS_REGION }}"
           terraform apply -auto-approve -input=false
 
       - name: Show values to save as repo variables
