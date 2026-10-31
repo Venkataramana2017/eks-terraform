@@ -1,0 +1,7 @@
+region            = "us-east-1"
+state_bucket_name = "eks-tfstate-bucket"
+github_repo       = "your-org/your-repo"
+cluster_name      = "demo-eks"
+
+# Set to false if this AWS account already has the GitHub OIDC provider
+create_github_oidc_provider = true

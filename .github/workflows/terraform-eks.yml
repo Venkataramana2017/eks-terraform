@@ -1,0 +1,199 @@
+name: EKS Terraform
+
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-eks.yml"
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-eks.yml"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "bootstrap = one-time setup (state bucket + IAM roles), run this first"
+        type: choice
+        options: [apply, destroy, bootstrap]
+        default: apply
+
+permissions:
+  id-token: write       # OIDC to AWS
+  contents: read
+  pull-requests: write  # post the plan as a PR comment
+
+# One run at a time per state; PR runs only cancel older runs of the same PR
+concurrency:
+  group: terraform-eks-${{ github.event_name == 'pull_request' && github.ref || 'state' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TF_IN_AUTOMATION: "true"
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+defaults:
+  run:
+    working-directory: terraform
+
+jobs:
+  plan:
+    name: Validate and plan
+    if: inputs.action != 'bootstrap'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.10"
+
+      # PRs get the read-only role; main / manual runs get the deploy role
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ github.event_name == 'pull_request' && vars.AWS_PLAN_ROLE_ARN || vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=eks/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+      - name: Terraform plan
+        id: plan
+        run: |
+          set -o pipefail
+          ARGS="-input=false -no-color -out=tfplan"
+          # PR runs use a read-only role, so skip the state lock
+          if [ "${{ github.event_name }}" = "pull_request" ]; then ARGS="$ARGS -lock=false"; fi
+          if [ "${{ inputs.action }}" = "destroy" ]; then ARGS="$ARGS -destroy"; fi
+          terraform plan $ARGS | tee plan.txt
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request' && always() && steps.plan.outcome != 'skipped'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const fence = '`'.repeat(3);
+            let plan = fs.existsSync('terraform/plan.txt')
+              ? fs.readFileSync('terraform/plan.txt', 'utf8')
+              : 'No plan output.';
+            if (plan.length > 60000) plan = plan.slice(0, 60000) + '\n... (truncated)';
+            const body = `### Terraform plan: \`${{ steps.plan.outcome }}\`\n<details><summary>Show plan</summary>\n\n${fence}\n${plan}\n${fence}\n</details>`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      - name: Upload plan
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/tfplan
+          retention-days: 1
+
+  apply:
+    name: Apply
+    needs: plan
+    if: github.event_name != 'pull_request' && inputs.action != 'bootstrap'
+    runs-on: ubuntu-latest
+    # Optional manual approval gate: create a matching GitHub environment in repo settings if desired.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.10"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: terraform
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=eks/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform apply
+        run: terraform apply -input=false tfplan
+
+      - name: Smoke test cluster
+        if: inputs.action != 'destroy'
+        run: |
+          CLUSTER=$(terraform output -raw cluster_name)
+          aws eks update-kubeconfig --region "${{ env.AWS_REGION }}" --name "$CLUSTER"
+          kubectl get nodes -o wide
+          kubectl get pods -A
+
+  # Run once: Actions tab > Run workflow > action = bootstrap
+  # Creates the S3 state bucket, the GitHub OIDC provider and the plan/apply roles.
+  bootstrap:
+    name: One-time bootstrap
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'bootstrap'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bootstrap
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~> 1.10"
+
+      # Temporary admin access keys, used by THIS job only (OIDC does not exist yet).
+      # Delete the secrets and the IAM access key once bootstrap has succeeded.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.BOOTSTRAP_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.BOOTSTRAP_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform apply
+        env:
+          TF_VAR_region: ${{ env.AWS_REGION }}
+          TF_VAR_github_repo: ${{ github.repository }}
+          TF_VAR_github_branch: ${{ github.event.repository.default_branch }}
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          export TF_VAR_state_bucket_name="eks-tfstate-${ACCOUNT_ID}-${{ env.AWS_REGION }}"
+          terraform apply -auto-approve -input=false
+
+      - name: Show values to save as repo variables
+        run: |
+          {
+            echo "### Add these as GitHub repo variables (Settings > Secrets and variables > Actions > Variables)"
+            echo '```'
+            terraform output -json | jq -r 'to_entries[] | "\(.key)=\(.value.value)"'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Bootstrap state is local to the runner; keep a copy in case you need to destroy it later
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-state
+          path: bootstrap/terraform.tfstate
+          retention-days: 30
